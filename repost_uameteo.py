@@ -52,7 +52,7 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
                 return resp.read()
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
-            print(f"Telegram HTTP {e.code}: {err_body}")
+            print(f"HTTP {e.code}: {err_body}")
             raise
         except Exception:
             if attempt == retries:
@@ -73,20 +73,37 @@ def clean_telegram_html(raw_html: str) -> str:
 
 
 def extract_photo_url(block: str) -> str | None:
-    # Шукаємо тег фото незалежно від того, що йде першим: class чи style
-    tag_match = re.search(r'<a[^>]*tgme_widget_message_photo_wrap[^>]*>', block)
-    if not tag_match:
-        return None
-    tag_html = tag_match.group(0)
-    url_match = re.search(r"background-image:\s*url\(['\"]?(https://[^'\")]+)['\"]?\)", tag_html)
-    return html.unescape(url_match.group(1)) if url_match else None
+    # Відрізаємо блок аватарки автора, щоб не підхопити її замість фото поста
+    bubble_pos = block.find("tgme_widget_message_bubble")
+    search_area = block[bubble_pos:] if bubble_pos != -1 else block
+
+    # 1. Шукаємо будь-яке background-image з CDN Telegram усередині повідомлення
+    bg_matches = re.findall(
+        r"background-image:\s*url\(['\"]?(https://[^'\")]+)['\"]?\)",
+        search_area
+    )
+    for url in bg_matches:
+        clean_url = html.unescape(url)
+        if "emoji" not in clean_url and "user_photo" not in clean_url:
+            return clean_url
+
+    # 2. Резервний пошук тегу <img> всередині медіа-блоку
+    img_matches = re.findall(
+        r'<img[^>]+src=["\'](https://[^"\']+)["\']',
+        search_area
+    )
+    for url in img_matches:
+        clean_url = html.unescape(url)
+        if "emoji" not in clean_url and "telegram.org/img" not in clean_url:
+            return clean_url
+
+    return None
 
 
 def parse_posts(page_html: str) -> list[dict]:
     posts = []
     blocks = page_html.split('class="tgme_widget_message_wrap')
     for block in blocks[1:]:
-        # Ігноруємо пости зі статтями Telegraph
         if "telegra.ph" in block.lower():
             continue
 
@@ -193,14 +210,23 @@ def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
 def send_photo_smart(photo_url: str, caption: str) -> bool:
     try:
         tg_send_photo_url(photo_url, caption)
+        print("Фото успішно надіслано за прямим посиланням.")
         return True
     except Exception as e:
         print(f"Пряме посилання не спрацювало ({e}), пробую завантажити файлом...")
 
     try:
-        img_req = urllib.request.Request(photo_url, headers={"User-Agent": "Mozilla/5.0"})
+        img_req = urllib.request.Request(
+            photo_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": f"https://t.me/s/{SOURCE_CHANNEL}"
+            }
+        )
         photo_bytes = fetch_with_retry(img_req, retries=2, timeout=25)
+        print(f"Завантажено {len(photo_bytes)} байт фото, відправляю в Telegram...")
         tg_send_photo_bytes(photo_bytes, caption)
+        print("Фото успішно надіслано файлом.")
         return True
     except Exception as e:
         print(f"Не вдалося надіслати фото файлом: {e}")
@@ -208,8 +234,8 @@ def send_photo_smart(photo_url: str, caption: str) -> bool:
 
 
 def publish_post(text: str, photo_url: str | None) -> None:
+    print(f"Знайдено photo_url: {photo_url}")
     if not photo_url:
-        print("Фото в пості не знайдено, відправляю лише текст.")
         tg_send_message(text)
         return
 
@@ -240,6 +266,7 @@ def main() -> None:
     last_sent_date = state.get("last_sent_for_date", "")
 
     if last_sent_date == tomorrow_str:
+        print(f"Прогноз на {tomorrow_str} вже було надіслано раніше.")
         return
 
     url = f"https://t.me/s/{SOURCE_CHANNEL}"
