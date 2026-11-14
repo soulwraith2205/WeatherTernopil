@@ -156,7 +156,7 @@ def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
 
     try:
         cmd = [
-            "curl", "-4", "-s", "-S", "--max-time", "30",
+            "curl", "--http1.1", "-4", "-s", "-S", "--max-time", "45",
             "-X", "POST", url,
             "-F", f"chat_id={CHANNEL_ID}",
             "-F", "parse_mode=HTML",
