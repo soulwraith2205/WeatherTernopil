@@ -212,7 +212,8 @@ def send_telegram_message(text: str) -> None:
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    fetch_with_retry(req, retries=3, timeout=20)
+    resp_bytes = fetch_with_retry(req, retries=3, timeout=20)
+    print("Telegram response:", resp_bytes.decode("utf-8"))
 
 
 def main() -> None:
