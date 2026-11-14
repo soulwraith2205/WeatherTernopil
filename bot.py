@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -10,8 +11,13 @@ LON = 25.5948
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = "state.json"
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+raw_channel_id = os.environ["CHANNEL_ID"].strip()
+CHANNEL_ID = (
+    raw_channel_id
+    if raw_channel_id.startswith(("@", "-"))
+    else f"@{raw_channel_id}"
+)
 
 # Налаштування шапок та текстів для кожного типу погоди
 WEATHER_TEMPLATES = {
@@ -103,6 +109,18 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
+                return resp.read()
+        except Exception:
+            if attempt == retries:
+                raise
+            time.sleep(5 * attempt)
+    return b""
+
+
 def format_approx_time(event_dt: datetime, now_dt: datetime) -> str:
     today = now_dt.date()
     event_date = event_dt.date()
@@ -168,16 +186,13 @@ def classify_weather(
     if code in (45, 48):
         events.append("fog")
 
-    # Сильні пориви вітру від 15 м/с
     if gusts_ms >= 15.0:
         events.append("wind")
 
-    # Ожеледиця: переохолоджені опади або температура <= 0°C на вологому покритті
     if temp is not None and temp <= 0.0:
         if code in (56, 57, 66, 67) or (has_precip_chance and is_wet) or had_recent_moisture:
             events.append("black_ice")
 
-    # Сильна спека: температура від +30°C
     if temp is not None and temp >= 30.0:
         events.append("extreme_heat")
 
@@ -197,14 +212,14 @@ def send_telegram_message(text: str) -> None:
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        resp.read()
+    fetch_with_retry(req, retries=3, timeout=20)
 
 
 def main() -> None:
     now_kyiv = datetime.now(KYIV_TZ)
     today_str = now_kyiv.strftime("%Y-%m-%d")
     state = load_state()
+    send_telegram_message("<b>🧪 Тест бота</b>\n\nБот працює!")
 
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
@@ -212,8 +227,8 @@ def main() -> None:
         f"&hourly=weather_code,precipitation_probability,wind_gusts_10m,temperature_2m,precipitation"
         f"&wind_speed_unit=ms&timezone=Europe%2FKyiv&forecast_days=3"
     )
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    raw_data = fetch_with_retry(url, retries=3, timeout=30)
+    data = json.loads(raw_data.decode("utf-8"))
 
     hourly = data["hourly"]
     times = hourly["time"]
@@ -251,8 +266,7 @@ def main() -> None:
         )
 
         for event_key in matched:
-            # Для дощу горизонт перевірки 48 годин, для інших явищ — 24 години
-            max_horizon = horizon_48h if event_key in ("rain", "downpour") else horizon_24h
+            max_horizon = horizon_48h if event_key == "rain" else horizon_24h
             if dt > max_horizon:
                 continue
 
@@ -268,7 +282,6 @@ def main() -> None:
                 and temp is not None
                 and dt.date() == detected_events[event_key]["dt"].date()
             ):
-                # Фіксуємо максимальну температуру спеки протягом того ж дня
                 current_max = detected_events[event_key]["temp"]
                 if current_max is None or temp > current_max:
                     detected_events[event_key]["temp"] = temp
@@ -303,5 +316,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    send_telegram_message("<b>🧪 Тест бота</b>\n\nБот підключений і працює коректно.")
+    
     main()
