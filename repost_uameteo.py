@@ -2,12 +2,23 @@ import html
 import json
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+# Примусово використовуємо IPv4, щоб уникнути таймаутів при завантаженні фото з GitHub Actions
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 SOURCE_CHANNEL = "uameteo"
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -34,7 +45,7 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
+def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 25) -> bytes:
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
@@ -46,7 +57,7 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
         except Exception:
             if attempt == retries:
                 raise
-            time.sleep(5 * attempt)
+            time.sleep(3 * attempt)
     return b""
 
 
@@ -65,6 +76,10 @@ def parse_posts(page_html: str) -> list[dict]:
     posts = []
     blocks = page_html.split('class="tgme_widget_message_wrap')
     for block in blocks[1:]:
+        # Ігноруємо пости зі статтями Telegraph
+        if "telegra.ph" in block.lower():
+            continue
+
         id_match = re.search(rf'data-post="{SOURCE_CHANNEL}/(\d+)"', block)
         if not id_match:
             continue
@@ -84,7 +99,7 @@ def parse_posts(page_html: str) -> list[dict]:
             r'class="tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:url\(\'(https://[^\']+)\'\)',
             block
         )
-        photo_url = photo_match.group(1) if photo_match else None
+        photo_url = html.unescape(photo_match.group(1)) if photo_match else None
 
         posts.append({
             "id": post_id,
@@ -138,13 +153,17 @@ def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
     body.extend(photo_bytes)
     body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
 
+    raw_body = bytes(body)
     req = urllib.request.Request(
         url,
-        data=bytes(body),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        data=raw_body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(raw_body))
+        },
         method="POST"
     )
-    resp_bytes = fetch_with_retry(req, retries=3, timeout=30)
+    resp_bytes = fetch_with_retry(req, retries=2, timeout=25)
     return json.loads(resp_bytes.decode("utf-8"))
 
 
@@ -155,24 +174,27 @@ def publish_post(text: str, photo_url: str | None) -> None:
             img_req = urllib.request.Request(photo_url, headers={"User-Agent": "Mozilla/5.0"})
             photo_bytes = fetch_with_retry(img_req, retries=2, timeout=20)
         except Exception as e:
-            print(f"Не вдалося завантажити фото, публікую лише текст: {e}")
+            print(f"Не вдалося завантажити фото: {e}")
 
-    if not photo_bytes:
-        tg_send_message(text)
-        return
+    if photo_bytes:
+        try:
+            if len(html.escape(text)) <= 1024:
+                tg_send_photo_bytes(photo_bytes, text)
+                return
+            else:
+                parts = text.split("\n\n", 1)
+                header_caption = parts[0]
+                while len(html.escape(header_caption)) > 1020:
+                    header_caption = header_caption[:-10]
 
-    # Перевіряємо довжину вже екранованого тексту (ліміт підпису Telegram — 1024 символи)
-    if len(html.escape(text)) <= 1024:
-        tg_send_photo_bytes(photo_bytes, text)
-    else:
-        parts = text.split("\n\n", 1)
-        header_caption = parts[0]
-        while len(html.escape(header_caption)) > 1020:
-            header_caption = header_caption[:-10]
+                tg_send_photo_bytes(photo_bytes, header_caption)
+                if len(parts) > 1 and parts[1].strip():
+                    tg_send_message(parts[1].strip())
+                return
+        except Exception as e:
+            print(f"Помилка відправки фото, відправляю лише текст: {e}")
 
-        tg_send_photo_bytes(photo_bytes, header_caption)
-        if len(parts) > 1 and parts[1].strip():
-            tg_send_message(parts[1].strip())
+    tg_send_message(text)
 
 
 def main() -> None:
@@ -192,7 +214,7 @@ def main() -> None:
         url,
         headers={"User-Agent": "Mozilla/5.0"}
     )
-    page_html = fetch_with_retry(req, retries=3, timeout=30).decode("utf-8", errors="ignore")
+    page_html = fetch_with_retry(req, retries=3, timeout=25).decode("utf-8", errors="ignore")
     posts = parse_posts(page_html)
 
     for post in posts:
