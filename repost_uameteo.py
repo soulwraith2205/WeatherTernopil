@@ -212,7 +212,7 @@ def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
         },
         method="POST"
     )
-    resp_bytes = fetch_with_retry(req, retries=2, timeout=30)
+    resp_bytes = fetch_with_retry(req, retries=1, timeout=60)
     return json.loads(resp_bytes.decode("utf-8"))
 
 
