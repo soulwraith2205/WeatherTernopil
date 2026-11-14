@@ -3,22 +3,52 @@ import json
 import os
 import re
 import socket
-import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-_orig_getaddrinfo = socket.getaddrinfo
+# Примусово використовуємо IPv4 та зменшений розмір TCP-пакетів (MSS 1200),
+# щоб великі файли фото не губилися в мережі GitHub Actions
+_orig_create_connection = socket.create_connection
 
 
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+def _small_mss_create_connection(
+    address,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address=None,
+    *,
+    all_errors=False
+):
+    host, port = address
+    err = None
+    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        af, socktype, proto, canonname, sa = res
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1200)
+            except OSError:
+                pass
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            err = exc
+            if sock is not None:
+                sock.close()
+    if err is not None:
+        raise err
+    raise OSError("getaddrinfo returns an empty list")
 
 
-socket.getaddrinfo = _ipv4_getaddrinfo
+socket.create_connection = _small_mss_create_connection
 
 SOURCE_CHANNEL = "uameteo"
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -150,27 +180,40 @@ def tg_send_message(text: str) -> dict:
 
 def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(photo_bytes)
-        tmp_path = tmp.name
+    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
 
-    try:
-        cmd = [
-            "curl", "--http1.1", "-4", "-s", "-S", "--max-time", "45",
-            "-X", "POST", url,
-            "-F", f"chat_id={CHANNEL_ID}",
-            "-F", "parse_mode=HTML",
-            "-F", f"caption={html.escape(caption)}",
-            "-F", f"photo=@{tmp_path};type=image/jpeg"
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(res.stdout)
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram API error: {res.stdout}")
-        return data
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    fields = {
+        "chat_id": CHANNEL_ID,
+        "caption": html.escape(caption),
+        "parse_mode": "HTML"
+    }
+
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(f"{value}\r\n".encode("utf-8"))
+
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(
+        b'Content-Disposition: form-data; name="photo"; filename="weather.jpg"\r\n'
+        b"Content-Type: image/jpeg\r\n\r\n"
+    )
+    body.extend(photo_bytes)
+    body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+    raw_body = bytes(body)
+    req = urllib.request.Request(
+        url,
+        data=raw_body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(raw_body))
+        },
+        method="POST"
+    )
+    resp_bytes = fetch_with_retry(req, retries=2, timeout=30)
+    return json.loads(resp_bytes.decode("utf-8"))
 
 
 def send_photo_smart(photo_url: str, caption: str) -> bool:
@@ -183,7 +226,7 @@ def send_photo_smart(photo_url: str, caption: str) -> bool:
             }
         )
         photo_bytes = fetch_with_retry(img_req, retries=2, timeout=25)
-        print(f"Завантажено {len(photo_bytes)} байт фото, відправляю через curl...")
+        print(f"Завантажено {len(photo_bytes)} байт фото, відправляю в Telegram...")
         tg_send_photo_bytes(photo_bytes, caption)
         print("Фото успішно надіслано!")
         return True
