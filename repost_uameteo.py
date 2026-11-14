@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# Примусово використовуємо IPv4, щоб уникнути таймаутів при завантаженні фото з GitHub Actions
+# Примусово використовуємо IPv4 для стабільної роботи на GitHub Actions
 _orig_getaddrinfo = socket.getaddrinfo
 
 
@@ -45,7 +45,7 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 25) -> bytes:
+def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
@@ -72,6 +72,16 @@ def clean_telegram_html(raw_html: str) -> str:
     return cleaned
 
 
+def extract_photo_url(block: str) -> str | None:
+    # Шукаємо тег фото незалежно від того, що йде першим: class чи style
+    tag_match = re.search(r'<a[^>]*tgme_widget_message_photo_wrap[^>]*>', block)
+    if not tag_match:
+        return None
+    tag_html = tag_match.group(0)
+    url_match = re.search(r"background-image:\s*url\(['\"]?(https://[^'\")]+)['\"]?\)", tag_html)
+    return html.unescape(url_match.group(1)) if url_match else None
+
+
 def parse_posts(page_html: str) -> list[dict]:
     posts = []
     blocks = page_html.split('class="tgme_widget_message_wrap')
@@ -94,12 +104,7 @@ def parse_posts(page_html: str) -> list[dict]:
             continue
 
         clean_text = clean_telegram_html(text_match.group(1))
-
-        photo_match = re.search(
-            r'class="tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:url\(\'(https://[^\']+)\'\)',
-            block
-        )
-        photo_url = html.unescape(photo_match.group(1)) if photo_match else None
+        photo_url = extract_photo_url(block)
 
         posts.append({
             "id": post_id,
@@ -126,6 +131,24 @@ def tg_send_message(text: str) -> dict:
         method="POST"
     )
     resp_bytes = fetch_with_retry(req, retries=3, timeout=25)
+    return json.loads(resp_bytes.decode("utf-8"))
+
+
+def tg_send_photo_url(photo_url: str, caption: str) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "photo": photo_url,
+        "caption": html.escape(caption),
+        "parse_mode": "HTML"
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    resp_bytes = fetch_with_retry(req, retries=2, timeout=25)
     return json.loads(resp_bytes.decode("utf-8"))
 
 
@@ -163,36 +186,46 @@ def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
         },
         method="POST"
     )
-    resp_bytes = fetch_with_retry(req, retries=2, timeout=25)
+    resp_bytes = fetch_with_retry(req, retries=2, timeout=45)
     return json.loads(resp_bytes.decode("utf-8"))
 
 
+def send_photo_smart(photo_url: str, caption: str) -> bool:
+    try:
+        tg_send_photo_url(photo_url, caption)
+        return True
+    except Exception as e:
+        print(f"Пряме посилання не спрацювало ({e}), пробую завантажити файлом...")
+
+    try:
+        img_req = urllib.request.Request(photo_url, headers={"User-Agent": "Mozilla/5.0"})
+        photo_bytes = fetch_with_retry(img_req, retries=2, timeout=25)
+        tg_send_photo_bytes(photo_bytes, caption)
+        return True
+    except Exception as e:
+        print(f"Не вдалося надіслати фото файлом: {e}")
+        return False
+
+
 def publish_post(text: str, photo_url: str | None) -> None:
-    photo_bytes = None
-    if photo_url:
-        try:
-            img_req = urllib.request.Request(photo_url, headers={"User-Agent": "Mozilla/5.0"})
-            photo_bytes = fetch_with_retry(img_req, retries=2, timeout=20)
-        except Exception as e:
-            print(f"Не вдалося завантажити фото: {e}")
+    if not photo_url:
+        print("Фото в пості не знайдено, відправляю лише текст.")
+        tg_send_message(text)
+        return
 
-    if photo_bytes:
-        try:
-            if len(html.escape(text)) <= 1024:
-                tg_send_photo_bytes(photo_bytes, text)
-                return
-            else:
-                parts = text.split("\n\n", 1)
-                header_caption = parts[0]
-                while len(html.escape(header_caption)) > 1020:
-                    header_caption = header_caption[:-10]
+    if len(html.escape(text)) <= 1024:
+        if send_photo_smart(photo_url, text):
+            return
+    else:
+        parts = text.split("\n\n", 1)
+        header_caption = parts[0]
+        while len(html.escape(header_caption)) > 1020:
+            header_caption = header_caption[:-10]
 
-                tg_send_photo_bytes(photo_bytes, header_caption)
-                if len(parts) > 1 and parts[1].strip():
-                    tg_send_message(parts[1].strip())
-                return
-        except Exception as e:
-            print(f"Помилка відправки фото, відправляю лише текст: {e}")
+        if send_photo_smart(photo_url, header_caption):
+            if len(parts) > 1 and parts[1].strip():
+                tg_send_message(parts[1].strip())
+            return
 
     tg_send_message(text)
 
