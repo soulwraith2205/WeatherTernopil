@@ -1,0 +1,37 @@
+name: Ternopil Weather Bot
+
+on:
+  schedule:
+    # Запуск кожні 3 години (00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC)
+    - cron: '0 */3 * * *'
+  # Дозволяє запустити перевірку вручну кнопкою для тесту
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-weather:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run weather check
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: python bot.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "Weather Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Update notification state"
+          git push
