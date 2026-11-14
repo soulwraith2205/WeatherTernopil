@@ -31,6 +31,10 @@ WEATHER_TEMPLATES = {
         "header": "🧊💧 ОПАДИ: ЛЬОДЯНА КРУПА",
         "text": "Наближається льодяна крупа / крижана мряка ❄️ Будьте обережні на дорогах."
     },
+    "black_ice": {
+        "header": "🧊⚠️ УВАГА! ОЖЕЛЕДИЦЯ НА ДОРОГАХ",
+        "text": "Очікується утворення ожеледиці ❄️ На дорогах і тротуарах буде дуже слизько — будьте обережні за кермом та під час ходьби."
+    },
     "blizzard": {
         "header": "🌨️💨 УВАГА! ХУРТОВИНА",
         "text": "Наближається хуртовина ❄️ Снігопад супроводжуватиметься сильними поривами вітру."
@@ -62,6 +66,10 @@ WEATHER_TEMPLATES = {
     "wind": {
         "header": "💨 УВАГА! СИЛЬНІ ПОРИВИ ВІТРУ",
         "text": "Очікуються сильні пориви вітру 🌬️ Уникайте перебування під старими деревами та білбордами."
+    },
+    "extreme_heat": {
+        "header": "🥵🔥 УВАГА! СИЛЬНА СПЕКА В ТЕРНОПОЛІ",
+        "text": "Очікується сильна спека ☀️ Пийте більше води, уникайте тривалого перебування на сонці та не залишайте дітей чи тварин у зачиненому авто."
     }
 }
 
@@ -73,6 +81,13 @@ WEEKDAYS_UA = {
     4: "у п'ятницю",
     5: "у суботу",
     6: "у неділю",
+}
+
+WET_WEATHER_CODES = {
+    51, 53, 55, 56, 57,
+    61, 63, 65, 66, 67,
+    71, 73, 75, 77,
+    80, 81, 82, 85, 86
 }
 
 
@@ -112,9 +127,20 @@ def format_approx_time(event_dt: datetime, now_dt: datetime) -> str:
     return f"{day_str} {part_of_day} (близько {event_dt.strftime('%H:%M')})"
 
 
-def classify_weather(code: int, gusts_ms: float, prob: int | None) -> list[str]:
+def format_temp(temp: float) -> str:
+    t = round(temp)
+    return f"+{t}°C" if t > 0 else f"{t}°C"
+
+
+def classify_weather(
+    code: int,
+    gusts_ms: float,
+    prob: int | None,
+    temp: float | None,
+    is_wet: bool,
+    had_recent_moisture: bool
+) -> list[str]:
     events = []
-    # Для опадів перевіряємо, щоб імовірність була не нижче 50% (якщо API її передає)
     has_precip_chance = prob is None or prob >= 50
 
     if has_precip_chance:
@@ -142,9 +168,18 @@ def classify_weather(code: int, gusts_ms: float, prob: int | None) -> list[str]:
     if code in (45, 48):
         events.append("fog")
 
-    # Сильні пориви вітру від 15 м/с (54 км/год — жовтий рівень небезпечності)
+    # Сильні пориви вітру від 15 м/с
     if gusts_ms >= 15.0:
         events.append("wind")
+
+    # Ожеледиця: переохолоджені опади або температура <= 0°C на вологому покритті
+    if temp is not None and temp <= 0.0:
+        if code in (56, 57, 66, 67) or (has_precip_chance and is_wet) or had_recent_moisture:
+            events.append("black_ice")
+
+    # Сильна спека: температура від +30°C
+    if temp is not None and temp >= 30.0:
+        events.append("extreme_heat")
 
     return events
 
@@ -174,8 +209,8 @@ def main() -> None:
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={LAT}&longitude={LON}"
-        f"&hourly=weather_code,precipitation_probability,wind_gusts_10m"
-        f"&wind_speed_unit=ms&timezone=Europe%2FKyiv&forecast_days=2"
+        f"&hourly=weather_code,precipitation_probability,wind_gusts_10m,temperature_2m,precipitation"
+        f"&wind_speed_unit=ms&timezone=Europe%2FKyiv&forecast_days=3"
     )
     with urllib.request.urlopen(url, timeout=15) as resp:
         data = json.loads(resp.read().decode("utf-8"))
@@ -185,29 +220,62 @@ def main() -> None:
     codes = hourly["weather_code"]
     probs = hourly["precipitation_probability"]
     gusts = hourly["wind_gusts_10m"]
+    temps = hourly["temperature_2m"]
+    precips = hourly["precipitation"]
 
-    # Шукаємо найближчий час для кожного погодного явища у межах наступних 24 годин
     detected_events = {}
-    horizon_end = now_kyiv + timedelta(hours=24)
+    horizon_24h = now_kyiv + timedelta(hours=24)
+    horizon_48h = now_kyiv + timedelta(hours=48)
+    last_wet_dt = None
 
-    for t_str, code, prob, gust in zip(times, codes, probs, gusts):
+    for t_str, code, prob, gust, temp, precip in zip(times, codes, probs, gusts, temps, precips):
         dt = datetime.fromisoformat(t_str).replace(tzinfo=KYIV_TZ)
-        if dt <= now_kyiv or dt > horizon_end:
+
+        is_wet = (precip is not None and precip > 0.1) or (code in WET_WEATHER_CODES)
+        had_recent_moisture = (
+            last_wet_dt is not None and (dt - last_wet_dt) <= timedelta(hours=6)
+        )
+        if is_wet:
+            last_wet_dt = dt
+
+        if dt <= now_kyiv or dt > horizon_48h:
             continue
 
-        matched = classify_weather(code, gust or 0.0, prob)
+        matched = classify_weather(
+            code,
+            gust or 0.0,
+            prob,
+            temp,
+            is_wet,
+            had_recent_moisture
+        )
+
         for event_key in matched:
+            # Для дощу горизонт перевірки 48 годин, для інших явищ — 24 години
+            max_horizon = horizon_48h if event_key in ("rain", "downpour") else horizon_24h
+            if dt > max_horizon:
+                continue
+
             if event_key not in detected_events:
                 detected_events[event_key] = {
                     "dt": dt,
                     "prob": prob,
-                    "gust": gust
+                    "gust": gust,
+                    "temp": temp
                 }
+            elif (
+                event_key == "extreme_heat"
+                and temp is not None
+                and dt.date() == detected_events[event_key]["dt"].date()
+            ):
+                # Фіксуємо максимальну температуру спеки протягом того ж дня
+                current_max = detected_events[event_key]["temp"]
+                if current_max is None or temp > current_max:
+                    detected_events[event_key]["temp"] = temp
 
     state_changed = False
 
     for event_key, info in detected_events.items():
-        # Якщо сповіщення про цей тип явища вже надсилалося сьогодні — пропускаємо до 00:00
         if state.get(event_key) == today_str:
             continue
 
@@ -215,8 +283,12 @@ def main() -> None:
         when_str = format_approx_time(info["dt"], now_kyiv)
 
         details = f"🕒 <b>Орієнтовний час:</b> {when_str}"
-        if event_key == "wind":
+        if event_key == "wind" and info["gust"] is not None:
             details += f"\n🌬️ <b>Пориви вітру:</b> до {round(info['gust'])} м/с"
+        elif event_key == "extreme_heat" and info["temp"] is not None:
+            details += f"\n🌡️ <b>Температура:</b> до {format_temp(info['temp'])}"
+        elif event_key == "black_ice" and info["temp"] is not None:
+            details += f"\n🌡️ <b>Температура повітря:</b> {format_temp(info['temp'])}"
         elif event_key != "fog" and info["prob"] is not None:
             details += f"\n📊 <b>Імовірність:</b> {info['prob']}%"
 
