@@ -3,7 +3,9 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -37,6 +39,10 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
         try:
             with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
                 return resp.read()
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            print(f"Telegram HTTP {e.code}: {err_body}")
+            raise
         except Exception:
             if attempt == retries:
                 raise
@@ -45,15 +51,10 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
 
 
 def clean_telegram_html(raw_html: str) -> str:
-    # Замінюємо <br> на переноси рядків
     text = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.IGNORECASE)
-    # Витягуємо стандартні емодзі з тегів Telegram Premium (<tg-emoji> або <i class="emoji"><b>...</b></i>)
     text = re.sub(r"<i[^>]*class=\"emoji\"[^>]*><b>(.*?)</b></i>", r"\1", text, flags=re.DOTALL)
-    # Видаляємо всі інші HTML-теги, залишаючи чистий текст
     text = re.sub(r"<[^>]+>", "", text)
-    # Декодуємо HTML-сутності (&quot;, &amp; тощо)
     text = html.unescape(text)
-    # Прибираємо зайві пробіли по краях рядків
     lines = [line.strip() for line in text.splitlines()]
     cleaned = "\n".join(lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
@@ -62,7 +63,6 @@ def clean_telegram_html(raw_html: str) -> str:
 
 def parse_posts(page_html: str) -> list[dict]:
     posts = []
-    # Розбиваємо сторінку на окремі блоки повідомлень
     blocks = page_html.split('class="tgme_widget_message_wrap')
     for block in blocks[1:]:
         id_match = re.search(rf'data-post="{SOURCE_CHANNEL}/(\d+)"', block)
@@ -80,7 +80,6 @@ def parse_posts(page_html: str) -> list[dict]:
 
         clean_text = clean_telegram_html(text_match.group(1))
 
-        # Шукаємо перше фото в пості, якщо воно є
         photo_match = re.search(
             r'class="tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:url\(\'(https://[^\']+)\'\)',
             block
@@ -97,8 +96,14 @@ def parse_posts(page_html: str) -> list[dict]:
     return posts
 
 
-def tg_api_call(method: str, payload: dict) -> dict:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+def tg_send_message(text: str) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "text": html.escape(text),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -109,43 +114,65 @@ def tg_api_call(method: str, payload: dict) -> dict:
     return json.loads(resp_bytes.decode("utf-8"))
 
 
-def publish_post(text: str, photo_url: str | None) -> None:
-    safe_text = html.escape(text)
+def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
 
-    if not photo_url:
-        tg_api_call("sendMessage", {
-            "chat_id": CHANNEL_ID,
-            "text": safe_text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        })
+    fields = {
+        "chat_id": CHANNEL_ID,
+        "caption": html.escape(caption),
+        "parse_mode": "HTML"
+    }
+
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(f"{value}\r\n".encode("utf-8"))
+
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(
+        b'Content-Disposition: form-data; name="photo"; filename="weather.jpg"\r\n'
+        b"Content-Type: image/jpeg\r\n\r\n"
+    )
+    body.extend(photo_bytes)
+    body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+    req = urllib.request.Request(
+        url,
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST"
+    )
+    resp_bytes = fetch_with_retry(req, retries=3, timeout=30)
+    return json.loads(resp_bytes.decode("utf-8"))
+
+
+def publish_post(text: str, photo_url: str | None) -> None:
+    photo_bytes = None
+    if photo_url:
+        try:
+            img_req = urllib.request.Request(photo_url, headers={"User-Agent": "Mozilla/5.0"})
+            photo_bytes = fetch_with_retry(img_req, retries=2, timeout=20)
+        except Exception as e:
+            print(f"Не вдалося завантажити фото, публікую лише текст: {e}")
+
+    if not photo_bytes:
+        tg_send_message(text)
         return
 
-    # Якщо текст вміщується в ліміт підпису до фото (1024 символи) — відправляємо одним постом
-    if len(text) <= 1000:
-        tg_api_call("sendPhoto", {
-            "chat_id": CHANNEL_ID,
-            "photo": photo_url,
-            "caption": safe_text,
-            "parse_mode": "HTML"
-        })
+    # Перевіряємо довжину вже екранованого тексту (ліміт підпису Telegram — 1024 символи)
+    if len(html.escape(text)) <= 1024:
+        tg_send_photo_bytes(photo_bytes, text)
     else:
-        # Якщо текст довший — перший абзац (заголовок із датою) йде підписом до фото, решта — одразу нижче
         parts = text.split("\n\n", 1)
-        header_caption = html.escape(parts[0][:1000])
-        tg_api_call("sendPhoto", {
-            "chat_id": CHANNEL_ID,
-            "photo": photo_url,
-            "caption": header_caption,
-            "parse_mode": "HTML"
-        })
+        header_caption = parts[0]
+        while len(html.escape(header_caption)) > 1020:
+            header_caption = header_caption[:-10]
+
+        tg_send_photo_bytes(photo_bytes, header_caption)
         if len(parts) > 1 and parts[1].strip():
-            tg_api_call("sendMessage", {
-                "chat_id": CHANNEL_ID,
-                "text": html.escape(parts[1].strip()),
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            })
+            tg_send_message(parts[1].strip())
 
 
 def main() -> None:
@@ -157,7 +184,6 @@ def main() -> None:
     last_sent_id = state.get("last_sent_id", 0)
     last_sent_date = state.get("last_sent_for_date", "")
 
-    # Якщо прогноз на завтрашню дату вже пересилали — виходимо
     if last_sent_date == tomorrow_str:
         return
 
@@ -173,7 +199,6 @@ def main() -> None:
         if post["id"] <= last_sent_id:
             continue
 
-        # Перевіряємо, чи це саме щоденний прогноз на завтра
         if target_phrase in post["text"]:
             publish_post(post["text"], post["photo_url"])
             state["last_sent_id"] = post["id"]
