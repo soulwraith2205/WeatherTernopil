@@ -3,14 +3,14 @@ import json
 import os
 import re
 import socket
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
-import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# Примусово використовуємо IPv4 для стабільної роботи на GitHub Actions
 _orig_getaddrinfo = socket.getaddrinfo
 
 
@@ -73,11 +73,9 @@ def clean_telegram_html(raw_html: str) -> str:
 
 
 def extract_photo_url(block: str) -> str | None:
-    # Відрізаємо блок аватарки автора, щоб не підхопити її замість фото поста
     bubble_pos = block.find("tgme_widget_message_bubble")
     search_area = block[bubble_pos:] if bubble_pos != -1 else block
 
-    # 1. Шукаємо будь-яке background-image з CDN Telegram усередині повідомлення
     bg_matches = re.findall(
         r"background-image:\s*url\(['\"]?(https://[^'\")]+)['\"]?\)",
         search_area
@@ -87,7 +85,6 @@ def extract_photo_url(block: str) -> str | None:
         if "emoji" not in clean_url and "user_photo" not in clean_url:
             return clean_url
 
-    # 2. Резервний пошук тегу <img> всередині медіа-блоку
     img_matches = re.findall(
         r'<img[^>]+src=["\'](https://[^"\']+)["\']',
         search_area
@@ -151,70 +148,32 @@ def tg_send_message(text: str) -> dict:
     return json.loads(resp_bytes.decode("utf-8"))
 
 
-def tg_send_photo_url(photo_url: str, caption: str) -> dict:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    payload = {
-        "chat_id": CHANNEL_ID,
-        "photo": photo_url,
-        "caption": html.escape(caption),
-        "parse_mode": "HTML"
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    resp_bytes = fetch_with_retry(req, retries=2, timeout=25)
-    return json.loads(resp_bytes.decode("utf-8"))
-
-
 def tg_send_photo_bytes(photo_bytes: bytes, caption: str) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(photo_bytes)
+        tmp_path = tmp.name
 
-    fields = {
-        "chat_id": CHANNEL_ID,
-        "caption": html.escape(caption),
-        "parse_mode": "HTML"
-    }
-
-    body = bytearray()
-    for name, value in fields.items():
-        body.extend(f"--{boundary}\r\n".encode("utf-8"))
-        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
-        body.extend(f"{value}\r\n".encode("utf-8"))
-
-    body.extend(f"--{boundary}\r\n".encode("utf-8"))
-    body.extend(
-        b'Content-Disposition: form-data; name="photo"; filename="weather.jpg"\r\n'
-        b"Content-Type: image/jpeg\r\n\r\n"
-    )
-    body.extend(photo_bytes)
-    body.extend(f"\r\n--{boundary}--\r\n".encode("utf-8"))
-
-    raw_body = bytes(body)
-    req = urllib.request.Request(
-        url,
-        data=raw_body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Content-Length": str(len(raw_body))
-        },
-        method="POST"
-    )
-    resp_bytes = fetch_with_retry(req, retries=2, timeout=45)
-    return json.loads(resp_bytes.decode("utf-8"))
+    try:
+        cmd = [
+            "curl", "-4", "-s", "-S", "--max-time", "30",
+            "-X", "POST", url,
+            "-F", f"chat_id={CHANNEL_ID}",
+            "-F", "parse_mode=HTML",
+            "-F", f"caption={html.escape(caption)}",
+            "-F", f"photo=@{tmp_path};type=image/jpeg"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram API error: {res.stdout}")
+        return data
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def send_photo_smart(photo_url: str, caption: str) -> bool:
-    try:
-        tg_send_photo_url(photo_url, caption)
-        print("Фото успішно надіслано за прямим посиланням.")
-        return True
-    except Exception as e:
-        print(f"Пряме посилання не спрацювало ({e}), пробую завантажити файлом...")
-
     try:
         img_req = urllib.request.Request(
             photo_url,
@@ -224,12 +183,12 @@ def send_photo_smart(photo_url: str, caption: str) -> bool:
             }
         )
         photo_bytes = fetch_with_retry(img_req, retries=2, timeout=25)
-        print(f"Завантажено {len(photo_bytes)} байт фото, відправляю в Telegram...")
+        print(f"Завантажено {len(photo_bytes)} байт фото, відправляю через curl...")
         tg_send_photo_bytes(photo_bytes, caption)
-        print("Фото успішно надіслано файлом.")
+        print("Фото успішно надіслано!")
         return True
     except Exception as e:
-        print(f"Не вдалося надіслати фото файлом: {e}")
+        print(f"Не вдалося надіслати фото: {e}")
         return False
 
 
