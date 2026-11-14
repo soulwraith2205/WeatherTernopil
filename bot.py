@@ -220,7 +220,6 @@ def main() -> None:
     now_kyiv = datetime.now(KYIV_TZ)
     today_str = now_kyiv.strftime("%Y-%m-%d")
     state = load_state()
-    send_telegram_message("<b>🧪 Тест бота</b>\n\nБот працює!")
 
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
