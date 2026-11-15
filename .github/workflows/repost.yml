@@ -3,7 +3,7 @@ name: Repost UAMeteo Forecast
 on:
   schedule:
     # Перевірка кожні 30 хвилин з 05:00 до 13:00 UTC (07:00–15:00 за Києвом)
-    - cron: '*/30 5-13 * * *'
+    - cron: '15 * * * *'
   workflow_dispatch:
 
 permissions:
