@@ -1,9 +1,50 @@
 import json
 import os
+import socket
+import subprocess
 import time
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+# Примусово використовуємо IPv4 та зменшений розмір TCP-пакетів (MSS 1200)
+_orig_create_connection = socket.create_connection
+
+
+def _small_mss_create_connection(
+    address,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address=None,
+    *,
+    all_errors=False
+):
+    host, port = address
+    err = None
+    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        af, socktype, proto, canonname, sa = res
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1200)
+            except OSError:
+                pass
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            err = exc
+            if sock is not None:
+                sock.close()
+    if err is not None:
+        raise err
+    raise OSError("getaddrinfo returns an empty list")
+
+
+socket.create_connection = _small_mss_create_connection
 
 # Координати Тернополя
 LAT = 49.5535
@@ -114,10 +155,25 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
         try:
             with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
                 return resp.read()
-        except Exception:
+        except Exception as e:
+            print(f"Спроба {attempt} через urllib не вдалася: {e}")
             if attempt == retries:
-                raise
-            time.sleep(5 * attempt)
+                if isinstance(req_or_url, str):
+                    cmd = ["curl", "--http1.1", "-4", "-s", "-S", "--max-time", "30", req_or_url]
+                    res = subprocess.run(cmd, capture_output=True, check=True)
+                    return res.stdout
+                else:
+                    url = req_or_url.full_url
+                    data = req_or_url.data
+                    cmd = [
+                        "curl", "--http1.1", "-4", "-s", "-S", "--max-time", "30",
+                        "-X", "POST", url,
+                        "-H", "Content-Type: application/json",
+                        "-d", data.decode("utf-8")
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, check=True)
+                    return res.stdout
+            time.sleep(4 * attempt)
     return b""
 
 
@@ -316,5 +372,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    
     main()
