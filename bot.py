@@ -150,7 +150,43 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
+def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 15) -> bytes:
+    # Якщо це простий GET-запит (наприклад, до Open-Meteo), використовуємо curl
+    # з перебором усіх IP-адрес домену, щоб оминути завислі сервери
+    if isinstance(req_or_url, str):
+        from urllib.parse import urlparse
+        parsed = urlparse(req_or_url)
+        host = parsed.hostname
+        port = parsed.port or 443
+
+        ips = []
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            ips = list(dict.fromkeys(info[4][0] for info in infos))
+        except Exception:
+            pass
+
+        # Спочатку пробуємо кожен конкретний IP по черзі з коротким таймаутом 12 сек
+        for ip in ips:
+            try:
+                cmd = [
+                    "curl", "--http1.1", "-4", "-s", "-S",
+                    "--connect-timeout", "8", "--max-time", "15",
+                    "--resolve", f"{host}:{port}:{ip}",
+                    req_or_url
+                ]
+                res = subprocess.run(cmd, capture_output=True, check=True)
+                if res.stdout:
+                    return res.stdout
+            except Exception as e:
+                print(f"Сервер {ip} не відповів: {e}")
+
+        # Резервний стандартний виклик
+        cmd = ["curl", "--http1.1", "-4", "-s", "-S", "--max-time", "25", req_or_url]
+        res = subprocess.run(cmd, capture_output=True, check=True)
+        return res.stdout
+
+    # Для POST-запитів у Telegram
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
@@ -158,24 +194,18 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 30) -> bytes:
         except Exception as e:
             print(f"Спроба {attempt} через urllib не вдалася: {e}")
             if attempt == retries:
-                if isinstance(req_or_url, str):
-                    cmd = ["curl", "--http1.1", "-4", "-s", "-S", "--max-time", "30", req_or_url]
-                    res = subprocess.run(cmd, capture_output=True, check=True)
-                    return res.stdout
-                else:
-                    url = req_or_url.full_url
-                    data = req_or_url.data
-                    cmd = [
-                        "curl", "--http1.1", "-4", "-s", "-S", "--max-time", "30",
-                        "-X", "POST", url,
-                        "-H", "Content-Type: application/json",
-                        "-d", data.decode("utf-8")
-                    ]
-                    res = subprocess.run(cmd, capture_output=True, check=True)
-                    return res.stdout
-            time.sleep(4 * attempt)
+                url = req_or_url.full_url
+                data = req_or_url.data
+                cmd = [
+                    "curl", "--http1.1", "-4", "-s", "-S", "--max-time", "25",
+                    "-X", "POST", url,
+                    "-H", "Content-Type: application/json",
+                    "-d", data.decode("utf-8")
+                ]
+                res = subprocess.run(cmd, capture_output=True, check=True)
+                return res.stdout
+            time.sleep(3 * attempt)
     return b""
-
 
 def format_approx_time(event_dt: datetime, now_dt: datetime) -> str:
     today = now_dt.date()
