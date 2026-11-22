@@ -5,6 +5,7 @@ import subprocess
 import time
 import urllib.request
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 # Примусово використовуємо IPv4 та зменшений розмір TCP-пакетів (MSS 1200)
@@ -120,6 +121,14 @@ WEATHER_TEMPLATES = {
     }
 }
 
+# Події, які перевіряємо на 48 годин вперед (решта — на 24 години)
+EVENTS_48H = {
+    "rain", "downpour", "drizzle",
+    "snow", "blizzard", "snow_grains",
+    "freezing_rain", "ice_pellets",
+    "thunderstorm", "hail"
+}
+
 WEEKDAYS_UA = {
     0: "у понеділок",
     1: "у вівторок",
@@ -151,10 +160,7 @@ def save_state(state: dict) -> None:
 
 
 def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 15) -> bytes:
-    # Якщо це простий GET-запит (наприклад, до Open-Meteo), використовуємо curl
-    # з перебором усіх IP-адрес домену, щоб оминути завислі сервери
     if isinstance(req_or_url, str):
-        from urllib.parse import urlparse
         parsed = urlparse(req_or_url)
         host = parsed.hostname
         port = parsed.port or 443
@@ -166,7 +172,6 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 15) -> bytes:
         except Exception:
             pass
 
-        # Спочатку пробуємо кожен конкретний IP по черзі з коротким таймаутом 12 сек
         for ip in ips:
             try:
                 cmd = [
@@ -181,12 +186,10 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 15) -> bytes:
             except Exception as e:
                 print(f"Сервер {ip} не відповів: {e}")
 
-        # Резервний стандартний виклик
         cmd = ["curl", "--http1.1", "-4", "-s", "-S", "--max-time", "25", req_or_url]
         res = subprocess.run(cmd, capture_output=True, check=True)
         return res.stdout
 
-    # Для POST-запитів у Telegram
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req_or_url, timeout=timeout) as resp:
@@ -206,6 +209,7 @@ def fetch_with_retry(req_or_url, retries: int = 3, timeout: int = 15) -> bytes:
                 return res.stdout
             time.sleep(3 * attempt)
     return b""
+
 
 def format_approx_time(event_dt: datetime, now_dt: datetime) -> str:
     today = now_dt.date()
@@ -245,7 +249,8 @@ def classify_weather(
     had_recent_moisture: bool
 ) -> list[str]:
     events = []
-    has_precip_chance = prob is None or prob >= 50
+    # Знижено поріг імовірності до 30%, щоб не пропускати помірні та локальні опади
+    has_precip_chance = prob is None or prob >= 40
 
     if has_precip_chance:
         if code in (96, 99):
@@ -307,13 +312,15 @@ def main() -> None:
     today_str = now_kyiv.strftime("%Y-%m-%d")
     state = load_state()
 
+    print(f"Перевірка погоди для Тернополя на {now_kyiv.strftime('%Y-%m-%d %H:%M')} (Київ)")
+
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={LAT}&longitude={LON}"
         f"&hourly=weather_code,precipitation_probability,wind_gusts_10m,temperature_2m,precipitation"
         f"&wind_speed_unit=ms&timezone=Europe%2FKyiv&forecast_days=3"
     )
-    raw_data = fetch_with_retry(url, retries=3, timeout=30)
+    raw_data = fetch_with_retry(url, retries=3, timeout=25)
     data = json.loads(raw_data.decode("utf-8"))
 
     hourly = data["hourly"]
@@ -329,6 +336,11 @@ def main() -> None:
     horizon_48h = now_kyiv + timedelta(hours=48)
     last_wet_dt = None
 
+    max_prob_48h = 0
+    max_gust_48h = 0.0
+    min_temp_48h = None
+    max_temp_48h = None
+
     for t_str, code, prob, gust, temp, precip in zip(times, codes, probs, gusts, temps, precips):
         dt = datetime.fromisoformat(t_str).replace(tzinfo=KYIV_TZ)
 
@@ -342,6 +354,14 @@ def main() -> None:
         if dt <= now_kyiv or dt > horizon_48h:
             continue
 
+        if prob is not None and prob > max_prob_48h:
+            max_prob_48h = prob
+        if gust is not None and gust > max_gust_48h:
+            max_gust_48h = gust
+        if temp is not None:
+            min_temp_48h = temp if min_temp_48h is None else min(min_temp_48h, temp)
+            max_temp_48h = temp if max_temp_48h is None else max(max_temp_48h, temp)
+
         matched = classify_weather(
             code,
             gust or 0.0,
@@ -352,7 +372,7 @@ def main() -> None:
         )
 
         for event_key in matched:
-            max_horizon = horizon_48h if event_key == "rain" else horizon_24h
+            max_horizon = horizon_48h if event_key in EVENTS_48H else horizon_24h
             if dt > max_horizon:
                 continue
 
@@ -372,10 +392,18 @@ def main() -> None:
                 if current_max is None or temp > current_max:
                     detected_events[event_key]["temp"] = temp
 
+    print(
+        f"Зведення за 48 год: макс. імовірність опадів={max_prob_48h}%, "
+        f"макс. пориви вітру={round(max_gust_48h, 1)} м/с, "
+        f"температура від {min_temp_48h}°C до {max_temp_48h}°C"
+    )
+    print(f"Знайдені події: {list(detected_events.keys()) if detected_events else 'немає'}")
+
     state_changed = False
 
     for event_key, info in detected_events.items():
         if state.get(event_key) == today_str:
+            print(f"Подія '{event_key}' вже надсилалася сьогодні ({today_str}), пропускаю.")
             continue
 
         tpl = WEATHER_TEMPLATES[event_key]
