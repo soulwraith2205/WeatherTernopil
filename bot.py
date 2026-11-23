@@ -129,6 +129,8 @@ EVENTS_48H = {
     "thunderstorm", "hail"
 }
 
+SNOW_EVENTS = {"snow", "blizzard", "snow_grains"}
+
 WEEKDAYS_UA = {
     0: "у понеділок",
     1: "у вівторок",
@@ -240,6 +242,37 @@ def format_temp(temp: float) -> str:
     return f"+{t}°C" if t > 0 else f"{t}°C"
 
 
+def format_snow_amount(snow_cm: float) -> str:
+    if snow_cm < 0.5:
+        return "незначний (до 0.5 см)"
+    rounded = round(snow_cm, 1)
+    if rounded.is_integer():
+        return f"близько {int(rounded)} см"
+    return f"близько {rounded} см"
+
+
+def calc_episode_snow_cm(
+    start_idx: int,
+    times: list[str],
+    snowfalls: list[float | None]
+) -> float:
+    total_cm = 0.0
+    gap_hours = 0
+    max_idx = min(len(times), start_idx + 24)
+
+    for idx in range(start_idx, max_idx):
+        sf = snowfalls[idx] or 0.0
+        if sf > 0.0:
+            total_cm += sf
+            gap_hours = 0
+        else:
+            gap_hours += 1
+            if gap_hours > 3:
+                break
+
+    return total_cm
+
+
 def classify_weather(
     code: int,
     gusts_ms: float,
@@ -249,7 +282,6 @@ def classify_weather(
     had_recent_moisture: bool
 ) -> list[str]:
     events = []
-    # Знижено поріг імовірності до 30%, щоб не пропускати помірні та локальні опади
     has_precip_chance = prob is None or prob >= 40
 
     if has_precip_chance:
@@ -317,7 +349,7 @@ def main() -> None:
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={LAT}&longitude={LON}"
-        f"&hourly=weather_code,precipitation_probability,wind_gusts_10m,temperature_2m,precipitation"
+        f"&hourly=weather_code,precipitation_probability,wind_gusts_10m,temperature_2m,precipitation,snowfall"
         f"&wind_speed_unit=ms&timezone=Europe%2FKyiv&forecast_days=3"
     )
     raw_data = fetch_with_retry(url, retries=3, timeout=25)
@@ -330,6 +362,7 @@ def main() -> None:
     gusts = hourly["wind_gusts_10m"]
     temps = hourly["temperature_2m"]
     precips = hourly["precipitation"]
+    snowfalls = hourly.get("snowfall", [0.0] * len(times))
 
     detected_events = {}
     horizon_24h = now_kyiv + timedelta(hours=24)
@@ -341,7 +374,9 @@ def main() -> None:
     min_temp_48h = None
     max_temp_48h = None
 
-    for t_str, code, prob, gust, temp, precip in zip(times, codes, probs, gusts, temps, precips):
+    for idx, (t_str, code, prob, gust, temp, precip) in enumerate(
+        zip(times, codes, probs, gusts, temps, precips)
+    ):
         dt = datetime.fromisoformat(t_str).replace(tzinfo=KYIV_TZ)
 
         is_wet = (precip is not None and precip > 0.1) or (code in WET_WEATHER_CODES)
@@ -377,11 +412,17 @@ def main() -> None:
                 continue
 
             if event_key not in detected_events:
+                snow_cm = (
+                    calc_episode_snow_cm(idx, times, snowfalls)
+                    if event_key in SNOW_EVENTS
+                    else 0.0
+                )
                 detected_events[event_key] = {
                     "dt": dt,
                     "prob": prob,
                     "gust": gust,
-                    "temp": temp
+                    "temp": temp,
+                    "snow_cm": snow_cm
                 }
             elif (
                 event_key == "extreme_heat"
@@ -410,7 +451,11 @@ def main() -> None:
         when_str = format_approx_time(info["dt"], now_kyiv)
 
         details = f"🕒 <b>Орієнтовний час:</b> {when_str}"
-        if event_key == "wind" and info["gust"] is not None:
+        if event_key in SNOW_EVENTS:
+            details += f"\n❄️ <b>Очікується снігу:</b> {format_snow_amount(info['snow_cm'])}"
+            if info["prob"] is not None:
+                details += f"\n📊 <b>Імовірність:</b> {info['prob']}%"
+        elif event_key == "wind" and info["gust"] is not None:
             details += f"\n🌬️ <b>Пориви вітру:</b> до {round(info['gust'])} м/с"
         elif event_key == "extreme_heat" and info["temp"] is not None:
             details += f"\n🌡️ <b>Температура:</b> до {format_temp(info['temp'])}"
